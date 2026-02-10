@@ -1,6 +1,10 @@
 ﻿#define WIN32_LEAN_AND_MEAN
+#ifndef UNICODE
 #define UNICODE
+#endif
+#ifndef _UNICODE
 #define _UNICODE
+#endif
 #define _WIN32_IE 0x0500
 #define _WIN32_WINNT 0x0600
 
@@ -63,6 +67,12 @@ const IID IID_IDWriteTextRenderer = {0xef8a8135, 0x5cc6, 0x45fe, {0x88, 0x25, 0x
 #define ID_SLIDER_SOLAR 2015
 #define ID_SLIDER_EMOJI 2016
 #define ID_SLIDER_LUNAR 2017
+#define ID_EDIT_SOLAR 2018
+#define ID_EDIT_EMOJI 2019
+#define ID_EDIT_LUNAR 2020
+#define ID_LBL_PCT_SOLAR 2021
+#define ID_LBL_PCT_EMOJI 2022
+#define ID_LBL_PCT_LUNAR 2023
 #define ID_LBL_TITLE 2100
 #define ID_LBL_POSX 2101
 #define ID_LBL_POSY 2102
@@ -131,6 +141,8 @@ static BOOL g_showLunar = TRUE;
 static int g_hoverNav = -1;
 static HFONT g_settingsFont = NULL;
 static UINT g_settingsFontDpi = 0;
+static BOOL g_syncingScaleEdits = FALSE;
+static int g_lastTodayYmd = 0;
 static ID2D1Factory* g_d2dFactory = NULL;
 static IDWriteFactory* g_dwriteFactory = NULL;
 static IDWriteFactory2* g_dwriteFactory2 = NULL;
@@ -360,6 +372,38 @@ static int ClampInt(int v, int minV, int maxV) {
     return v;
 }
 
+static int CenterY(int rowTop, int rowH, int ctrlH) {
+    return rowTop + (rowH - ctrlH) / 2;
+}
+
+static int GetTodayYmd(SYSTEMTIME* outSt) {
+    SYSTEMTIME st;
+    SYSTEMTIME* p = outSt ? outSt : &st;
+    GetLocalTime(p);
+    return p->wYear * 10000 + p->wMonth * 100 + p->wDay;
+}
+
+static BOOL IsSupportedWindows() {
+    RTL_OSVERSIONINFOW vi;
+    ZeroMemory(&vi, sizeof(vi));
+    vi.dwOSVersionInfoSize = sizeof(vi);
+    HMODULE hNt = GetModuleHandleW(L"ntdll.dll");
+    if (hNt) {
+        typedef LONG (WINAPI *RtlGetVersion_t)(PRTL_OSVERSIONINFOW);
+        RtlGetVersion_t pRtlGetVersion = (RtlGetVersion_t)GetProcAddress(hNt, "RtlGetVersion");
+        if (pRtlGetVersion && pRtlGetVersion(&vi) == 0) {
+            return (vi.dwMajorVersion >= 10);
+        }
+    }
+    OSVERSIONINFOW osv;
+    ZeroMemory(&osv, sizeof(osv));
+    osv.dwOSVersionInfoSize = sizeof(osv);
+    if (GetVersionExW(&osv)) {
+        return (osv.dwMajorVersion >= 10);
+    }
+    return FALSE;
+}
+
 static int Luminance(COLORREF c) {
     int r = GetRValue(c);
     int g = GetGValue(c);
@@ -567,6 +611,8 @@ static void ApplySettingsFont(HWND hwnd, HFONT font) {
         ID_LBL_SOLAR, ID_LBL_EMOJI, ID_LBL_LUNAR,
         ID_EDIT_X, ID_EDIT_Y, ID_OPACITY_TRACK, ID_BTN_COLOR, ID_BTN_FONT, ID_LBL_FONTINFO,
         ID_SLIDER_SOLAR, ID_SLIDER_EMOJI, ID_SLIDER_LUNAR,
+        ID_EDIT_SOLAR, ID_EDIT_EMOJI, ID_EDIT_LUNAR,
+        ID_LBL_PCT_SOLAR, ID_LBL_PCT_EMOJI, ID_LBL_PCT_LUNAR,
         ID_EMOJI_STYLE, ID_BTN_EMOJI_FONT, ID_LBL_EMOJI_FONT, ID_CHK_AUTORUN, ID_CHK_STICK,
         ID_CHK_PRIMARY, ID_CHK_MOVE, ID_APPLY, IDOK, IDCANCEL
     };
@@ -574,6 +620,46 @@ static void ApplySettingsFont(HWND hwnd, HFONT font) {
         HWND h = GetDlgItem(hwnd, ids[i]);
         if (h) SendMessageW(h, WM_SETFONT, (WPARAM)font, TRUE);
     }
+}
+
+static void UpdateScaleEditsFromSliders(HWND hwnd) {
+    if (g_syncingScaleEdits) return;
+    g_syncingScaleEdits = TRUE;
+    wchar_t buf[16];
+    int solar = (int)SendMessage(GetDlgItem(hwnd, ID_SLIDER_SOLAR), TBM_GETPOS, 0, 0);
+    int emoji = (int)SendMessage(GetDlgItem(hwnd, ID_SLIDER_EMOJI), TBM_GETPOS, 0, 0);
+    int lunar = (int)SendMessage(GetDlgItem(hwnd, ID_SLIDER_LUNAR), TBM_GETPOS, 0, 0);
+    swprintf(buf, 16, L"%d", solar);
+    SetWindowTextW(GetDlgItem(hwnd, ID_EDIT_SOLAR), buf);
+    swprintf(buf, 16, L"%d", emoji);
+    SetWindowTextW(GetDlgItem(hwnd, ID_EDIT_EMOJI), buf);
+    swprintf(buf, 16, L"%d", lunar);
+    SetWindowTextW(GetDlgItem(hwnd, ID_EDIT_LUNAR), buf);
+    g_syncingScaleEdits = FALSE;
+}
+
+static void ApplyScaleEditToSlider(HWND hwnd, int editId, int sliderId, int minV, int maxV) {
+    if (g_syncingScaleEdits) return;
+    wchar_t buf[16];
+    GetWindowTextW(GetDlgItem(hwnd, editId), buf, 16);
+    int val = _wtoi(buf);
+    val = ClampInt(val, minV, maxV);
+    g_syncingScaleEdits = TRUE;
+    swprintf(buf, 16, L"%d", val);
+    SetWindowTextW(GetDlgItem(hwnd, editId), buf);
+    SendMessage(GetDlgItem(hwnd, sliderId), TBM_SETPOS, TRUE, val);
+    g_syncingScaleEdits = FALSE;
+}
+
+static int GetClampedEditValue(HWND hwnd, int editId, int minV, int maxV, int fallback) {
+    wchar_t buf[16];
+    GetWindowTextW(GetDlgItem(hwnd, editId), buf, 16);
+    int val = fallback;
+    if (buf[0] != 0) val = _wtoi(buf);
+    val = ClampInt(val, minV, maxV);
+    swprintf(buf, 16, L"%d", val);
+    SetWindowTextW(GetDlgItem(hwnd, editId), buf);
+    return val;
 }
 
 static void SetSettingsWindowSize(HWND hwnd, UINT dpi, int clientW, int clientH) {
@@ -602,10 +688,13 @@ static void LayoutSettingsControls(HWND hwnd, UINT dpi) {
     int btnH = ScaleByDpi(32, dpi);
     int trackH = ScaleByDpi(30, dpi);
     int gapY = ScaleByDpi(8, dpi);
+    int gapX = ScaleByDpi(8, dpi);
     int labelW = ScaleByDpi(100, dpi);
     int editW = ScaleByDpi(100, dpi);
     int smallBtnW = ScaleByDpi(100, dpi);
     int comboW = ScaleByDpi(140, dpi);
+    int scaleEditW = ScaleByDpi(52, dpi);
+    int pctW = ScaleByDpi(16, dpi);
     int clientW = ScaleByDpi(520, dpi);
     int clientH = ScaleByDpi(500, dpi);
 
@@ -613,50 +702,69 @@ static void LayoutSettingsControls(HWND hwnd, UINT dpi) {
     HFONT font = EnsureSettingsFont(dpi);
     ApplySettingsFont(hwnd, font);
 
-    MoveWindow(GetDlgItem(hwnd, ID_LBL_TITLE), m, y, clientW - m * 2, ScaleByDpi(24, dpi), TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_LBL_TITLE), m, y, clientW - m * 2, rowH, TRUE);
     y += ScaleByDpi(30, dpi);
 
-    MoveWindow(GetDlgItem(hwnd, ID_LBL_POSX), m, y, labelW, rowH, TRUE);
-    MoveWindow(GetDlgItem(hwnd, ID_EDIT_X), m + labelW, y - 1, editW, editH, TRUE);
+    int rowHPos = (rowH > editH) ? rowH : editH;
+    MoveWindow(GetDlgItem(hwnd, ID_LBL_POSX), m, CenterY(y, rowHPos, rowH), labelW, rowH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_EDIT_X), m + labelW, CenterY(y, rowHPos, editH), editW, editH, TRUE);
     int x2 = m + labelW + editW + ScaleByDpi(20, dpi);
-    MoveWindow(GetDlgItem(hwnd, ID_LBL_POSY), x2, y, labelW, rowH, TRUE);
-    MoveWindow(GetDlgItem(hwnd, ID_EDIT_Y), x2 + labelW, y - 1, editW, editH, TRUE);
-    y += rowH + gapY;
+    MoveWindow(GetDlgItem(hwnd, ID_LBL_POSY), x2, CenterY(y, rowHPos, rowH), labelW, rowH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_EDIT_Y), x2 + labelW, CenterY(y, rowHPos, editH), editW, editH, TRUE);
+    y += rowHPos + gapY;
 
-    MoveWindow(GetDlgItem(hwnd, ID_LBL_OPACITY), m, y, labelW, rowH, TRUE);
-    MoveWindow(GetDlgItem(hwnd, ID_OPACITY_TRACK), m + labelW, y - ScaleByDpi(2, dpi),
+    int rowHOpacity = trackH;
+    MoveWindow(GetDlgItem(hwnd, ID_LBL_OPACITY), m, CenterY(y, rowHOpacity, rowH), labelW, rowH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_OPACITY_TRACK), m + labelW, CenterY(y, rowHOpacity, trackH),
         clientW - (m + labelW) - m, trackH, TRUE);
-    y += trackH + gapY;
+    y += rowHOpacity + gapY;
 
-    MoveWindow(GetDlgItem(hwnd, ID_BTN_COLOR), m, y, ScaleByDpi(140, dpi), btnH, TRUE);
-    MoveWindow(GetDlgItem(hwnd, ID_BTN_FONT), m + ScaleByDpi(150, dpi), y, smallBtnW, btnH, TRUE);
-    MoveWindow(GetDlgItem(hwnd, ID_LBL_FONTINFO), m + ScaleByDpi(260, dpi), y + ScaleByDpi(6, dpi),
+    int rowHButtons = btnH;
+    MoveWindow(GetDlgItem(hwnd, ID_BTN_COLOR), m, CenterY(y, rowHButtons, btnH), ScaleByDpi(140, dpi), btnH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_BTN_FONT), m + ScaleByDpi(150, dpi), CenterY(y, rowHButtons, btnH), smallBtnW, btnH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_LBL_FONTINFO), m + ScaleByDpi(260, dpi), CenterY(y, rowHButtons, rowH),
         clientW - (m + ScaleByDpi(260, dpi)) - m, rowH, TRUE);
-    y += btnH + gapY;
+    y += rowHButtons + gapY;
 
-    MoveWindow(GetDlgItem(hwnd, ID_LBL_SOLAR), m, y, labelW, rowH, TRUE);
-    MoveWindow(GetDlgItem(hwnd, ID_SLIDER_SOLAR), m + labelW, y - ScaleByDpi(2, dpi),
-        clientW - (m + labelW) - m, trackH, TRUE);
-    y += trackH + gapY;
+    int sliderW = clientW - (m + labelW) - m - scaleEditW - pctW - gapX * 2;
+    int rowHSlider = trackH;
+    MoveWindow(GetDlgItem(hwnd, ID_LBL_SOLAR), m, CenterY(y, rowHSlider, rowH), labelW, rowH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_SLIDER_SOLAR), m + labelW, CenterY(y, rowHSlider, trackH),
+        sliderW, trackH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_EDIT_SOLAR), m + labelW + sliderW + gapX, CenterY(y, rowHSlider, editH),
+        scaleEditW, editH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_LBL_PCT_SOLAR), m + labelW + sliderW + gapX + scaleEditW + gapX,
+        CenterY(y, rowHSlider, rowH), pctW, rowH, TRUE);
+    y += rowHSlider + gapY;
 
-    MoveWindow(GetDlgItem(hwnd, ID_LBL_EMOJI), m, y, labelW, rowH, TRUE);
-    MoveWindow(GetDlgItem(hwnd, ID_SLIDER_EMOJI), m + labelW, y - ScaleByDpi(2, dpi),
-        clientW - (m + labelW) - m, trackH, TRUE);
-    y += trackH + gapY;
+    MoveWindow(GetDlgItem(hwnd, ID_LBL_EMOJI), m, CenterY(y, rowHSlider, rowH), labelW, rowH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_SLIDER_EMOJI), m + labelW, CenterY(y, rowHSlider, trackH),
+        sliderW, trackH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_EDIT_EMOJI), m + labelW + sliderW + gapX, CenterY(y, rowHSlider, editH),
+        scaleEditW, editH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_LBL_PCT_EMOJI), m + labelW + sliderW + gapX + scaleEditW + gapX,
+        CenterY(y, rowHSlider, rowH), pctW, rowH, TRUE);
+    y += rowHSlider + gapY;
 
-    MoveWindow(GetDlgItem(hwnd, ID_LBL_LUNAR), m, y, labelW, rowH, TRUE);
-    MoveWindow(GetDlgItem(hwnd, ID_SLIDER_LUNAR), m + labelW, y - ScaleByDpi(2, dpi),
-        clientW - (m + labelW) - m, trackH, TRUE);
-    y += trackH + gapY;
+    MoveWindow(GetDlgItem(hwnd, ID_LBL_LUNAR), m, CenterY(y, rowHSlider, rowH), labelW, rowH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_SLIDER_LUNAR), m + labelW, CenterY(y, rowHSlider, trackH),
+        sliderW, trackH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_EDIT_LUNAR), m + labelW + sliderW + gapX, CenterY(y, rowHSlider, editH),
+        scaleEditW, editH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_LBL_PCT_LUNAR), m + labelW + sliderW + gapX + scaleEditW + gapX,
+        CenterY(y, rowHSlider, rowH), pctW, rowH, TRUE);
+    y += rowHSlider + gapY;
 
-    MoveWindow(GetDlgItem(hwnd, ID_LBL_EMOJI_STYLE), m, y, labelW, rowH, TRUE);
-    MoveWindow(GetDlgItem(hwnd, ID_EMOJI_STYLE), m + labelW, y - 2, comboW, ScaleByDpi(200, dpi), TRUE);
-    MoveWindow(GetDlgItem(hwnd, ID_BTN_EMOJI_FONT), m + labelW + comboW + ScaleByDpi(10, dpi), y - 2,
+    int rowHCombo = btnH;
+    MoveWindow(GetDlgItem(hwnd, ID_LBL_EMOJI_STYLE), m, CenterY(y, rowHCombo, rowH), labelW, rowH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_EMOJI_STYLE), m + labelW, CenterY(y, rowHCombo, editH),
+        comboW, ScaleByDpi(200, dpi), TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_BTN_EMOJI_FONT), m + labelW + comboW + ScaleByDpi(10, dpi), CenterY(y, rowHCombo, btnH),
         smallBtnW + ScaleByDpi(20, dpi), btnH, TRUE);
     MoveWindow(GetDlgItem(hwnd, ID_LBL_EMOJI_FONT),
-        m + labelW + comboW + smallBtnW + ScaleByDpi(40, dpi), y + ScaleByDpi(4, dpi),
+        m + labelW + comboW + smallBtnW + ScaleByDpi(40, dpi), CenterY(y, rowHCombo, rowH),
         clientW - (m + labelW + comboW + smallBtnW + ScaleByDpi(40, dpi)) - m, rowH, TRUE);
-    y += btnH + gapY;
+    y += rowHCombo + gapY;
 
     MoveWindow(GetDlgItem(hwnd, ID_CHK_AUTORUN), m, y, clientW - m * 2, rowH, TRUE);
     y += rowH + ScaleByDpi(2, dpi);
@@ -944,6 +1052,15 @@ static void ClampPositionToVisibleMonitor() {
 static void SendToBack() {
     if (g_cfg.stickDesktop) {
         SetWindowPos(g_hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+}
+
+static void UpdateStickTimer(HWND hwnd) {
+    if (!hwnd) return;
+    if (g_cfg.stickDesktop) {
+        SetTimer(hwnd, 2, 500, NULL);
+    } else {
+        KillTimer(hwnd, 2);
     }
 }
 
@@ -1948,11 +2065,21 @@ static void ApplySettingsFromDialog(HWND hwnd) {
     g_cfg.stickDesktop = (BST_CHECKED == SendMessage(GetDlgItem(hwnd, ID_CHK_STICK), BM_GETCHECK, 0, 0));
     g_cfg.primaryScreenOnly = (BST_CHECKED == SendMessage(GetDlgItem(hwnd, ID_CHK_PRIMARY), BM_GETCHECK, 0, 0));
     g_cfg.allowMove = (BST_CHECKED == SendMessage(GetDlgItem(hwnd, ID_CHK_MOVE), BM_GETCHECK, 0, 0));
+    UpdateStickTimer(g_hwnd);
     UpdateClickThroughStyle();
     g_cfg.emojiMono = ((int)SendMessage(GetDlgItem(hwnd, ID_EMOJI_STYLE), CB_GETCURSEL, 0, 0) == 1);
-    g_cfg.solarScalePct = (int)SendMessage(GetDlgItem(hwnd, ID_SLIDER_SOLAR), TBM_GETPOS, 0, 0);
-    g_cfg.emojiScalePct = (int)SendMessage(GetDlgItem(hwnd, ID_SLIDER_EMOJI), TBM_GETPOS, 0, 0);
-    g_cfg.lunarScalePct = (int)SendMessage(GetDlgItem(hwnd, ID_SLIDER_LUNAR), TBM_GETPOS, 0, 0);
+    int solar = (int)SendMessage(GetDlgItem(hwnd, ID_SLIDER_SOLAR), TBM_GETPOS, 0, 0);
+    int emoji = (int)SendMessage(GetDlgItem(hwnd, ID_SLIDER_EMOJI), TBM_GETPOS, 0, 0);
+    int lunar = (int)SendMessage(GetDlgItem(hwnd, ID_SLIDER_LUNAR), TBM_GETPOS, 0, 0);
+    solar = GetClampedEditValue(hwnd, ID_EDIT_SOLAR, 90, 180, solar);
+    emoji = GetClampedEditValue(hwnd, ID_EDIT_EMOJI, 70, 160, emoji);
+    lunar = GetClampedEditValue(hwnd, ID_EDIT_LUNAR, 60, 120, lunar);
+    SendMessage(GetDlgItem(hwnd, ID_SLIDER_SOLAR), TBM_SETPOS, TRUE, solar);
+    SendMessage(GetDlgItem(hwnd, ID_SLIDER_EMOJI), TBM_SETPOS, TRUE, emoji);
+    SendMessage(GetDlgItem(hwnd, ID_SLIDER_LUNAR), TBM_SETPOS, TRUE, lunar);
+    g_cfg.solarScalePct = solar;
+    g_cfg.emojiScalePct = emoji;
+    g_cfg.lunarScalePct = lunar;
     SyncScaleFromConfig();
     SetAutoRun(g_cfg.autoRun);
     CalculateMetrics();
@@ -1996,16 +2123,28 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM l
                 0, 0, 0, 0, hwnd, (HMENU)ID_SLIDER_SOLAR, NULL, NULL);
             SendMessageW(hSolar, TBM_SETRANGE, TRUE, MAKELPARAM(90, 180));
             SendMessageW(hSolar, TBM_SETPOS, TRUE, g_cfg.solarScalePct);
+            CreateWindowW(L"EDIT", L"", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER | ES_RIGHT,
+                0, 0, 0, 0, hwnd, (HMENU)ID_EDIT_SOLAR, NULL, NULL);
+            CreateWindowW(L"STATIC", L"%", WS_VISIBLE | WS_CHILD,
+                0, 0, 0, 0, hwnd, (HMENU)ID_LBL_PCT_SOLAR, NULL, NULL);
             CreateWindowW(L"STATIC", L"Emoji Size:", WS_VISIBLE | WS_CHILD, 0, 0, 0, 0, hwnd, (HMENU)ID_LBL_EMOJI, NULL, NULL);
             HWND hEmoji = CreateWindowW(L"MSCTLS_TRACKBAR32", L"", WS_VISIBLE | WS_CHILD | TBS_HORZ,
                 0, 0, 0, 0, hwnd, (HMENU)ID_SLIDER_EMOJI, NULL, NULL);
             SendMessageW(hEmoji, TBM_SETRANGE, TRUE, MAKELPARAM(70, 160));
             SendMessageW(hEmoji, TBM_SETPOS, TRUE, g_cfg.emojiScalePct);
+            CreateWindowW(L"EDIT", L"", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER | ES_RIGHT,
+                0, 0, 0, 0, hwnd, (HMENU)ID_EDIT_EMOJI, NULL, NULL);
+            CreateWindowW(L"STATIC", L"%", WS_VISIBLE | WS_CHILD,
+                0, 0, 0, 0, hwnd, (HMENU)ID_LBL_PCT_EMOJI, NULL, NULL);
             CreateWindowW(L"STATIC", L"Lunar Size:", WS_VISIBLE | WS_CHILD, 0, 0, 0, 0, hwnd, (HMENU)ID_LBL_LUNAR, NULL, NULL);
             HWND hLunar = CreateWindowW(L"MSCTLS_TRACKBAR32", L"", WS_VISIBLE | WS_CHILD | TBS_HORZ,
                 0, 0, 0, 0, hwnd, (HMENU)ID_SLIDER_LUNAR, NULL, NULL);
             SendMessageW(hLunar, TBM_SETRANGE, TRUE, MAKELPARAM(60, 120));
             SendMessageW(hLunar, TBM_SETPOS, TRUE, g_cfg.lunarScalePct);
+            CreateWindowW(L"EDIT", L"", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER | ES_RIGHT,
+                0, 0, 0, 0, hwnd, (HMENU)ID_EDIT_LUNAR, NULL, NULL);
+            CreateWindowW(L"STATIC", L"%", WS_VISIBLE | WS_CHILD,
+                0, 0, 0, 0, hwnd, (HMENU)ID_LBL_PCT_LUNAR, NULL, NULL);
             CreateWindowW(L"STATIC", L"Emoji Style:", WS_VISIBLE | WS_CHILD, 0, 0, 0, 0, hwnd, (HMENU)ID_LBL_EMOJI_STYLE, NULL, NULL);
             HWND hEmojiStyle = CreateWindowW(L"COMBOBOX", L"", WS_VISIBLE | WS_CHILD | CBS_DROPDOWNLIST,
                 0, 0, 0, 0, hwnd, (HMENU)ID_EMOJI_STYLE, NULL, NULL);
@@ -2030,6 +2169,13 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM l
             swprintf(val, 16, L"%d", g_cfg.x); SetWindowTextW(GetDlgItem(hwnd, ID_EDIT_X), val);
             swprintf(val, 16, L"%d", g_cfg.y); SetWindowTextW(GetDlgItem(hwnd, ID_EDIT_Y), val);
             SyncScaleFromConfig();
+            SendMessageW(GetDlgItem(hwnd, ID_EDIT_SOLAR), EM_SETLIMITTEXT, 3, 0);
+            SendMessageW(GetDlgItem(hwnd, ID_EDIT_EMOJI), EM_SETLIMITTEXT, 3, 0);
+            SendMessageW(GetDlgItem(hwnd, ID_EDIT_LUNAR), EM_SETLIMITTEXT, 3, 0);
+            SendMessageW(GetDlgItem(hwnd, ID_SLIDER_SOLAR), TBM_SETPOS, TRUE, g_cfg.solarScalePct);
+            SendMessageW(GetDlgItem(hwnd, ID_SLIDER_EMOJI), TBM_SETPOS, TRUE, g_cfg.emojiScalePct);
+            SendMessageW(GetDlgItem(hwnd, ID_SLIDER_LUNAR), TBM_SETPOS, TRUE, g_cfg.lunarScalePct);
+            UpdateScaleEditsFromSliders(hwnd);
             LayoutSettingsControls(hwnd, GetDpiForWindowCompat(hwnd));
             return 0;
         }
@@ -2073,6 +2219,19 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM l
                 DestroyWindow(hwnd);
                 g_settingsHwnd = NULL;
             }
+            else if (HIWORD(wP) == EN_KILLFOCUS) {
+                int id = LOWORD(wP);
+                if (id == ID_EDIT_SOLAR) {
+                    ApplyScaleEditToSlider(hwnd, ID_EDIT_SOLAR, ID_SLIDER_SOLAR, 90, 180);
+                    ApplyScaleFromUI(hwnd, TRUE);
+                } else if (id == ID_EDIT_EMOJI) {
+                    ApplyScaleEditToSlider(hwnd, ID_EDIT_EMOJI, ID_SLIDER_EMOJI, 70, 160);
+                    ApplyScaleFromUI(hwnd, TRUE);
+                } else if (id == ID_EDIT_LUNAR) {
+                    ApplyScaleEditToSlider(hwnd, ID_EDIT_LUNAR, ID_SLIDER_LUNAR, 60, 120);
+                    ApplyScaleFromUI(hwnd, TRUE);
+                }
+            }
             return 0;
         case WM_HSCROLL: {
             HWND hCtl = (HWND)lP;
@@ -2080,6 +2239,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM l
                 hCtl == GetDlgItem(hwnd, ID_SLIDER_EMOJI) ||
                 hCtl == GetDlgItem(hwnd, ID_SLIDER_LUNAR)) {
                 ApplyScaleFromUI(hwnd, TRUE);
+                UpdateScaleEditsFromSliders(hwnd);
             }
             return 0;
         }
@@ -2109,20 +2269,26 @@ static void ShowSettings() {
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = SettingsWndProc;
     wc.hInstance = GetModuleHandle(NULL);
+    wc.hIcon = g_hIcon;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.lpszClassName = L"SettingsClass";
+    wc.hIconSm = g_hIcon;
     RegisterClassExW(&wc);
     g_settingsHwnd = CreateWindowW(L"SettingsClass", L"Calendar Settings",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 520, 420, NULL, NULL, wc.hInstance, NULL);
+    if (g_settingsHwnd && g_hIcon) {
+        SendMessageW(g_settingsHwnd, WM_SETICON, ICON_BIG, (LPARAM)g_hIcon);
+        SendMessageW(g_settingsHwnd, WM_SETICON, ICON_SMALL, (LPARAM)g_hIcon);
+    }
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM lP) {
     switch(msg) {
         case WM_CREATE: {
             SetTimer(hwnd, 1, 60000, NULL);
-            SetTimer(hwnd, 2, 500, NULL);
+            UpdateStickTimer(hwnd);
             g_hTooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL,
                 WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
                 CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
@@ -2145,14 +2311,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM lP) {
         case WM_TIMER:
             if (wP == 1) {
                 MaybeStartOnlineCheck();
-                if (g_followToday) {
-                    SYSTEMTIME st;
-                    GetLocalTime(&st);
-                    if (g_viewMonth != st.wMonth || g_viewYear != st.wYear) {
+                SYSTEMTIME st;
+                int today = GetTodayYmd(&st);
+                if (today != g_lastTodayYmd) {
+                    g_lastTodayYmd = today;
+                    BOOL needRedraw = (g_viewMonth == st.wMonth && g_viewYear == st.wYear);
+                    if (g_followToday && !needRedraw) {
                         SetViewMonthYear(st.wMonth, st.wYear, TRUE);
+                        needRedraw = TRUE;
                     }
+                    if (needRedraw) DrawCalendar(hwnd);
                 }
-                DrawCalendar(hwnd);
             } else if (wP == 2 && g_cfg.stickDesktop) {
                 if (!g_mouseInside && !g_dragging) {
                     SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -2385,6 +2554,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM lP) {
                 else if (cmd == 1005) {
                     g_cfg.stickDesktop = !g_cfg.stickDesktop;
                     SaveConfig();
+                    UpdateStickTimer(hwnd);
                     if (g_cfg.stickDesktop) SendToBack();
                 }
                 else if (cmd == 1006) {
@@ -2424,6 +2594,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM lP) {
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
+    if (!IsSupportedWindows()) {
+        MessageBoxW(NULL,
+            L"This app supports Windows 10 and 11 only.",
+            L"Unsupported Windows",
+            MB_OK | MB_ICONERROR);
+        return 0;
+    }
     HMODULE hUser32 = LoadLibraryW(L"user32.dll");
     if (hUser32) {
         typedef BOOL (WINAPI *SetProcessDpiAwarenessContext_t)(DPI_AWARENESS_CONTEXT);
@@ -2449,6 +2626,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
     g_onlineLockInit = TRUE;
     if (g_cfg.autoRun) SetAutoRun(TRUE);
     SetViewToToday();
+    g_lastTodayYmd = GetTodayYmd(NULL);
     CalculateMetrics();
     if (g_cfg.x < 0 || g_cfg.y < 0) {
         RECT rc;
@@ -2499,4 +2677,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
     ReleaseDWriteResources();
     if (g_hIcon) DestroyIcon(g_hIcon);
     return 0;
+}
+
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int show) {
+    return WinMain(hInst, hPrev, GetCommandLineA(), show);
 }

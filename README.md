@@ -74,6 +74,25 @@ windres resource.rc -O coff -o resource.o
 gcc -O2 -municode vietcalendar.c resource.o -o VietCalendar.exe -lcomdlg32 -lshell32 -lwininet -ld2d1 -ldwrite -lgdi32 -lole32 -luuid -luser32 -ladvapi32
 ```
 
+### 32-bit (x86)
+MSVC: use the "x86 Native Tools Command Prompt" and build as usual.
+
+MinGW-w64: use a 32-bit toolchain and add `-m32`:
+```bat
+windres resource.rc -O coff -o resource.o
+gcc -O2 -m32 -municode vietcalendar.c resource.o -o VietCalendar-32.exe -lcomdlg32 -lshell32 -lwininet -ld2d1 -ldwrite -lgdi32 -lole32 -luuid -luser32 -ladvapi32
+```
+
+If you see "skipping incompatible" or "cannot find" for Windows libraries, you are using a 64-bit toolchain.
+Install a 32-bit MinGW-w64 toolchain and use its `gcc` (often `i686-w64-mingw32-gcc`), for example:
+```bat
+i686-w64-mingw32-windres resource.rc -O coff -o resource.o
+i686-w64-mingw32-gcc -O2 -municode -mwindows vietcalendar.c resource.o -o VietCalendar-32.exe -lcomdlg32 -lshell32 -lwininet -ld2d1 -ldwrite -lgdi32 -lole32 -luuid -luser32 -ladvapi32
+```
+
+### Task Manager Note
+The widget uses a tray icon and a tool window (no taskbar button), so it appears under **Background processes** and in the **Details** tab instead of the **Apps** list. This is expected.
+
 ## Notes
 - The widget is DPI-aware and scales on high-DPI displays.
 - If the widget becomes unclickable, toggle `Move/Click Through` from the tray menu.
