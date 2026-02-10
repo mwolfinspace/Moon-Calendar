@@ -1,0 +1,16 @@
+1 ICON "sample.ico"
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904E4"
+        BEGIN
+            VALUE "FileDescription", "Vietnamese Lunar Calendar\0"
+            VALUE "FileVersion", "1.0\0"
+            VALUE "InternalName", "VietCalendar\0"
+            VALUE "ProductName", "Vietnamese Lunar Calendar Widget\0"
+        END
+    END
+END
